@@ -1,5 +1,6 @@
 from copy import deepcopy
 from typing import List
+from dataclasses import dataclass
 
 from transformers import (PreTrainedModel,
                           PreTrainedTokenizer,
@@ -15,11 +16,45 @@ from pygaggle.model import (BatchTokenizer,
                             SpecialTokensCleaner,
                             greedy_decode)
 
+from pygaggle.rerank.base import TextType
 
 __all__ = ['T5Reranker',
            'UnsupervisedTransformerReranker',
            'SequenceClassificationTransformerReranker',
            'QuestionAnsweringTransformerReranker']
+
+
+@dataclass
+class SingleEncoderOutput:
+    encoder_output: torch.Tensor
+    token_ids: torch.Tensor
+    text: TextType
+
+
+class SpecialTokensCleaner:
+    def __init__(self, tokenizer: PreTrainedTokenizer):
+        self.special_ids = tokenizer.all_special_ids
+
+    def clean(self, output: SingleEncoderOutput) -> SingleEncoderOutput:
+        indices = [idx for idx, tok in enumerate(output.token_ids.tolist())
+                   if tok not in self.special_ids]
+        if not indices:
+            print('skipping', output.token_ids.tolist(), self.special_ids)
+            return None
+        if len(output.token_ids) != len(output.encoder_output):
+            import ipdb
+            ipdb.set_trace()
+            print('output are note the same', output.token_ids.tolist())
+            # self.special_ids, indices)
+            print(indices)
+            pass
+        assert max(indices) < len(output.encoder_output)
+        assert max(indices) < len(output.token_ids)
+        assert len(output.token_ids) == len(output.encoder_output)
+        assert 0 <= min(indices)
+        print(len(output.encoder_output), len(indices))
+        return SingleEncoderOutput(output.encoder_output[indices],
+                                   output.token_ids[indices], output.text)
 
 
 class T5Reranker(Reranker):
@@ -84,8 +119,14 @@ class UnsupervisedTransformerReranker(Reranker):
         for enc_doc, text in zip(encoded_documents, texts):
             if self.clean_special:
                 enc_doc = self.cleaner.clean(enc_doc)
+                if enc_doc is None:
+                    continue
+            #print(len(encoded_query.encoder_output), len(enc_doc.encoder_output))
             matrix = self.sim_matrix_provider.compute_matrix(encoded_query,
                                                              enc_doc)
+            if matrix.size(1) > 512:
+                print('skipping matrix with size:', matrix.size())
+                continue
             score = self.methods[self.method](matrix) if matrix.size(1) > 0 \
                 else -10000
             text.score = score
@@ -119,7 +160,7 @@ class SequenceClassificationTransformerReranker(Reranker):
             output, = self.model(input_ids, token_type_ids=tt_ids)
             if output.size(1) > 1:
                 text.score = torch.nn.functional.log_softmax(
-                                output, 1)[0, -1].item()
+                    output, 1)[0, -1].item()
             else:
                 text.score = output.item()
         return texts
@@ -132,9 +173,9 @@ class QuestionAnsweringTransformerReranker(Reranker):
         self.device = next(model.parameters()).device
 
     @torch.no_grad()
-    def rerank(self, query: Query, texts: List[Text]) -> List[Text]:
-        texts = deepcopy(texts)
-        for text in texts:
+    def rerank(self, query: Query, hits: List[Text]) -> List[Text]:
+        hits = deepcopy(hits)
+        for text in hits:
             ret = self.tokenizer.encode_plus(query.text,
                                              text.text,
                                              max_length=512,
@@ -151,4 +192,4 @@ class QuestionAnsweringTransformerReranker(Reranker):
             smax_val, smax_idx = start_scores.max(0)
             emax_val, emax_idx = end_scores.max(0)
             text.score = max(smax_val.item(), emax_val.item())
-        return texts
+        return hits
