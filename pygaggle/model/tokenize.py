@@ -23,7 +23,7 @@ TokenizerReturnType = Mapping[str, Union[torch.Tensor, List[int],
 
 @dataclass
 class TokenizerOutputBatch:
-    output: TokenizerReturnType
+    features: TokenizerReturnType
     texts: List[TextType]
 
     def __len__(self):
@@ -52,8 +52,15 @@ class TokenizerEncodeMixin:
         ret['tokens'] = list(map(self.tokenizer.tokenize, strings))
         return ret
 
+import abc
+class DocumentTokenizer(abc.ABC):
 
-class BatchTokenizer(TokenizerEncodeMixin):
+    @abc.abstractmethod
+    def encode(self, document: List[str]):
+        raise NotImplementedError('encode')
+
+class BatchTokenizer(DocumentTokenizer):
+    
     def __init__(self,
                  tokenizer: PreTrainedTokenizer,
                  batch_size: int,
@@ -62,13 +69,20 @@ class BatchTokenizer(TokenizerEncodeMixin):
         self.batch_size = batch_size
         self.tokenizer_kwargs = tokenizer_kwargs
 
+    def encode(self, strings: List[str]) -> TokenizerReturnType:
+        ret = self.tokenizer.batch_encode_plus(strings,
+                                               **self.tokenizer_kwargs)
+        ret['tokens'] = [ self.tokenizer.tokenize(s) for s in strings ]
+        ret['tokens_length'] = [ len(s) for s in ret['tokens'] ]
+        return ret
+
     def traverse(
             self,
             batch_input: List[TextType]) -> Iterable[TokenizerOutputBatch]:
-        for batch_idx in range(0, len(batch_input), self.batch_size):
-            inputs = batch_input[batch_idx:batch_idx + self.batch_size]
-            input_ids = self.encode([x.text for x in inputs])
-            yield TokenizerOutputBatch(input_ids, inputs)
+        for batch_idx in range(0, len(batch_input) + self.batch_size - 1, self.batch_size):
+            text_list = batch_input[batch_idx:batch_idx + self.batch_size]
+            features = self.encode([x.text for x in text_list])
+            yield TokenizerOutputBatch(features, text_list)
 
 
 class AppendEosTokenizerMixin:
@@ -102,7 +116,8 @@ class QueryDocumentBatchTokenizer(TokenizerEncodeMixin):
             docs = batch_input.documents[batch_idx:batch_idx + self.batch_size]
             outputs = self.encode([self.pattern.format(
                                         query=query.text,
-                                        document=doc.text) for doc in docs])
+                                        document=doc.text) for doc in docs], truncation=True)
+            raise
             yield QueryDocumentBatch(query, docs, outputs)
 
 

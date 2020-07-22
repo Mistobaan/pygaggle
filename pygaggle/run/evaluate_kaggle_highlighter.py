@@ -202,17 +202,18 @@ def construct_qa_transformer(options: KaggleEvaluationOptions) -> Reranker:
             model = AutoModelForQuestionAnswering.from_pretrained(
                 options.model_name)
         else:
-            print(options.model_name)
             config_dict, _ = PretrainedConfig.get_config_dict(options.model_name)
             config = BertConfig.from_dict(config_dict)
             model = BertForQuestionAnswering(config)
     except OSError:
         model = AutoModelForQuestionAnswering.from_pretrained(
             options.model_name, from_tf=True)
+        logging.info('loaded model: %s', model.__class__)
     device = torch.device(options.device)
     model = model.to(device).eval()
     tokenizer = AutoTokenizer.from_pretrained(
         options.tokenizer_name, do_lower_case=options.do_lower_case)
+    logging.info('loaded tokenizer %s', tokenizer.__class__)
     return QuestionAnsweringTransformerReranker(model, tokenizer)
 
 
@@ -256,7 +257,7 @@ def main():
     stdout = []
     import time
     start = time.time()
-    with open(f'{options.model_name}.csv', 'w') as fd:
+    with open(f'{options.model_name.replace("/","_")}.csv', 'w') as fd:
         logging.info('writing %s.csv', options.model_name)
         for metric in evaluator.evaluate(examples):
             logging.info(f'{metric.name:<{width}}{metric.value:.5}')

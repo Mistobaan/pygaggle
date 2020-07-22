@@ -95,7 +95,7 @@ def construct_transformer(options:
                                       from_tf=options.from_tf).to(device).eval()
     tokenizer = SimpleBatchTokenizer(AutoTokenizer.from_pretrained(
         options.tokenizer_name),
-        options.batch_size)
+        options.batch_size, max_length=128) #model.config.max_positional_embedding)
     provider = CosineSimilarityMatrixProvider()
     return UnsupervisedTransformerReranker(model, tokenizer, provider)
 

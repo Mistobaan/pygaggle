@@ -18,6 +18,16 @@ class SimilarityMatrixProvider:
 
 class CosineSimilarityMatrixProvider(SimilarityMatrixProvider):
     @torch.no_grad()
+    def compute_matrix_v2(self,
+                       query_repr,
+                       doc_repr) -> torch.Tensor:
+        matrix = torch.einsum('mh,nh->mn', query_repr, doc_repr)
+        dnorm = doc_repr.norm(p=2, dim=1).unsqueeze(0)
+        qnorm = query_repr.norm(p=2, dim=1).unsqueeze(1)
+        matrix = (matrix / (qnorm + 1e-7)) / (dnorm + 1e-7)
+        return matrix
+
+    @torch.no_grad()
     def compute_matrix(self,
                        encoded_query: SingleEncoderOutput,
                        encoded_document: SingleEncoderOutput) -> torch.Tensor:

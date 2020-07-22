@@ -14,6 +14,7 @@ from pygaggle.model import (BatchTokenizer,
                             QueryDocumentBatch,
                             QueryDocumentBatchTokenizer,
                             SpecialTokensCleaner,
+                            SpacySenticizer,
                             greedy_decode)
 
 from pygaggle.rerank.base import TextType
@@ -38,23 +39,19 @@ class SpecialTokensCleaner:
     def clean(self, output: SingleEncoderOutput) -> SingleEncoderOutput:
         indices = [idx for idx, tok in enumerate(output.token_ids.tolist())
                    if tok not in self.special_ids]
+        
         if not indices:
-            print('skipping', output.token_ids.tolist(), self.special_ids)
+            # the whole input is a special id...
             return None
-        if len(output.token_ids) != len(output.encoder_output):
-            import ipdb
-            ipdb.set_trace()
-            print('output are note the same', output.token_ids.tolist())
-            # self.special_ids, indices)
-            print(indices)
-            pass
-        assert max(indices) < len(output.encoder_output)
-        assert max(indices) < len(output.token_ids)
-        assert len(output.token_ids) == len(output.encoder_output)
-        assert 0 <= min(indices)
-        print(len(output.encoder_output), len(indices))
-        return SingleEncoderOutput(output.encoder_output[indices],
-                                   output.token_ids[indices], output.text)
+        #if len(output.token_ids) != len(output.encoder_output):
+        #    pass
+        #assert max(indices) < len(output.encoder_output)
+        #assert max(indices) < len(output.token_ids)
+        # assert len(output.token_ids) == len(output.encoder_output)
+        # assert 0 <= min(indices)
+        return SingleEncoderOutput(encoder_output=output.encoder_output[indices],
+                                   token_ids=output.token_ids[indices], 
+                                   text=output.text)
 
 
 class T5Reranker(Reranker):
@@ -85,6 +82,11 @@ class T5Reranker(Reranker):
                 doc.score = score
         return texts
 
+def batch(iterable, n=1):
+    l = len(iterable)
+    for ndx in range(0, l, n):
+        yield iterable[ndx:min(ndx + n, l)]
+
 
 class UnsupervisedTransformerReranker(Reranker):
     methods = dict(max=lambda x: x.max().item(),
@@ -94,15 +96,16 @@ class UnsupervisedTransformerReranker(Reranker):
 
     def __init__(self,
                  model: PreTrainedModel,
-                 tokenizer: BatchTokenizer,
+                 tokenizer: PreTrainedTokenizer,
                  sim_matrix_provider: SimilarityMatrixProvider,
                  method: str = 'max',
                  clean_special: bool = True,
                  argmax_only: bool = False):
         assert method in self.methods, 'inappropriate scoring method'
         self.model = model
+        max_seq_length = self.model.config.max_position_embeddings
         self.tokenizer = tokenizer
-        self.encoder = LongBatchEncoder(model, tokenizer)
+        self.batch_encoder = LongBatchEncoder(model, tokenizer, max_seq_length=max_seq_length)
         self.sim_matrix_provider = sim_matrix_provider
         self.method = method
         self.clean_special = clean_special
@@ -110,32 +113,75 @@ class UnsupervisedTransformerReranker(Reranker):
         self.device = next(self.model.parameters(), None).device
         self.argmax_only = argmax_only
 
+        print(self.tokenizer.__class__)
+
+    def split(self, documents: List[Text]) -> List[Text]:
+        batch_size = 16
+        senticizer = SpacySenticizer()
+        for idx, doc in enumerate(documents):
+            document_features = []
+            # split document into sentences
+            sentences = senticizer(doc.text)
+            # encode sentences
+            sentences_to_features = self.tokenizer.tokenizer.batch_encode_plus(sentences, max_len=128)
+            # max num sentences per doc, max length sentence
+            # for b in batch(sentences_to_features, batch_size):
+            #     document_features.append((idx, b))
+            yield sentences_to_features
+
     @torch.no_grad()
-    def rerank(self, query: Query, texts: List[Text]) -> List[Text]:
-        encoded_query = self.encoder.encode_single(query)
-        encoded_documents = self.encoder.encode(texts)
-        texts = deepcopy(texts)
+    def rerank(self, query: Query, documents: List[Text]) -> List[Text]:
+        MIN_SCORE = -10_000
+
+        query_features = list(self.split([query]))[0]
+        encoded_query = self.batch_encoder.align(query_features['input_ids'])
+        encoded_query = encoded_query[:, 0, :]
+
+        result = []
+        document_features = []
+        for features in self.split(documents):
+            output = self.batch_encoder.align(features['input_ids'])
+            # output = output.unsqueeze(0) # add batch
+            # print(output.shape)
+            document_features.append(torch.squeeze(output[:, 0, :]))
+
+        for b in batch(document_features, 128):
+            batch_torch = torch.stack(b)
+            #print(encoded_query.shape, batch_torch.shape)
+            matrix = self.sim_matrix_provider.compute_matrix_v2(encoded_query, batch_torch)
+            # batch_scores = self.methods[self.method](matrix)
+            if matrix.size(1) == 1:
+                result.append(matrix.squeeze().tolist())
+            else:
+                print(matrix.shape)
+                result.extend(matrix.squeeze().tolist())
+        # print(result)
+        return result
+
+        # import sys;sys.exit()
+        encoded_documents = self.batch_encoder.encode(documents)
+        documents = deepcopy(documents)
         max_score = None
-        for enc_doc, text in zip(encoded_documents, texts):
+        for enc_doc, text in zip(encoded_documents, documents):
             if self.clean_special:
                 enc_doc = self.cleaner.clean(enc_doc)
                 if enc_doc is None:
+                    print('invalid enc_doc')
                     continue
-            #print(len(encoded_query.encoder_output), len(enc_doc.encoder_output))
-            matrix = self.sim_matrix_provider.compute_matrix(encoded_query,
-                                                             enc_doc)
-            if matrix.size(1) > 512:
-                print('skipping matrix with size:', matrix.size())
-                continue
-            score = self.methods[self.method](matrix) if matrix.size(1) > 0 \
-                else -10000
+                print('after:', enc_doc.shape, text.shape)
+
+            matrix = self.sim_matrix_provider.compute_matrix(encoded_query, enc_doc)
+            if matrix.size(1) > 0:
+                score = self.methods[self.method](matrix)
+            else:
+                score = MIN_SCORE
             text.score = score
             max_score = score if max_score is None else max(max_score, score)
         if self.argmax_only:
-            for text in texts:
+            for text in documents:
                 if text.score != max_score:
-                    text.score = max_score - 10000
-        return texts
+                    text.score = max_score - 10_000
+        return documents
 
 
 class SequenceClassificationTransformerReranker(Reranker):
@@ -179,6 +225,7 @@ class QuestionAnsweringTransformerReranker(Reranker):
             ret = self.tokenizer.encode_plus(query.text,
                                              text.text,
                                              max_length=512,
+                                             truncation=True,
                                              return_tensors='pt',
                                              return_token_type_ids=True)
             input_ids = ret['input_ids'].to(self.device)
